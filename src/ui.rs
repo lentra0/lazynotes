@@ -16,11 +16,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_right_panel(frame, chunks[1], app);
 }
 
-fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
-    let titles: Vec<ListItem> = app
-        .notes
+fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
+    let items: Vec<ListItem> = app
+        .sidebar_items
         .iter()
-        .map(|n| ListItem::new(Line::from(n.title.clone())))
+        .map(|n| {
+            let indent = "  ".repeat(n.depth);
+            let marker = if n.is_dir {
+                if n.expanded { "▾ " } else { "▸ " }
+            } else {
+                "  "
+            };
+            let display = format!("{}{}{}", indent, marker, n.name);
+            ListItem::new(Line::from(display))
+        })
         .collect();
 
     let block = Block::default()
@@ -32,18 +41,18 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             Style::default()
         });
 
-    let list = List::new(titles)
+    let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▪ ");
 
-    frame.render_stateful_widget(list, area, &mut app.sidebar_state.clone());
+    frame.render_stateful_widget(list, area, &mut app.sidebar_state);
 }
 
 fn draw_right_panel(frame: &mut Frame, area: Rect, app: &mut App) {
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
         .split(area);
 
     // Title editor
@@ -69,13 +78,13 @@ fn draw_right_panel(frame: &mut Frame, area: Rect, app: &mut App) {
         Style::default()
     };
 
-    let text = if app.lines.is_empty() {
+    let text_lines: Vec<Line> = if app.lines.is_empty() {
         vec![Line::raw("")]
     } else {
         app.lines.iter().map(|l| Line::raw(l.clone())).collect()
     };
 
-    let mut paragraph = Paragraph::new(Text::from(text))
+    let paragraph = Paragraph::new(Text::from(text_lines))
         .block(
             Block::default()
                 .title(if app.dirty { " Content * " } else { " Content " })
@@ -84,8 +93,7 @@ fn draw_right_panel(frame: &mut Frame, area: Rect, app: &mut App) {
         )
         .wrap(Wrap { trim: false })
         .scroll((app.scroll_y as u16, 0));
-
-    frame.render_widget(paragraph.clone(), right_chunks[1]);
+    frame.render_widget(paragraph, right_chunks[1]);
 
     // Cursor placement
     match app.focus {
@@ -95,7 +103,6 @@ fn draw_right_panel(frame: &mut Frame, area: Rect, app: &mut App) {
             frame.set_cursor(x.min(right_chunks[0].right().saturating_sub(2)), y);
         }
         Focus::Content => {
-            // ensure scroll is correct before placing cursor
             let (cx, cy) = content_cursor_to_screen(right_chunks[1], app);
             frame.set_cursor(cx, cy);
         }
@@ -103,12 +110,11 @@ fn draw_right_panel(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 
     // Footer help
-
     let help = Line::from(vec![
         Span::styled("Tab", Style::default().fg(Color::Yellow)),
         Span::raw(" cycle  "),
-        Span::styled("h/l", Style::default().fg(Color::Yellow)),
-        Span::raw(" focus  "),
+        Span::styled("Space/Enter", Style::default().fg(Color::Yellow)),
+        Span::raw(" expand  "),
         Span::styled("n", Style::default().fg(Color::Yellow)),
         Span::raw(" new  "),
         Span::styled("Ctrl+S", Style::default().fg(Color::Yellow)),
@@ -117,14 +123,7 @@ fn draw_right_panel(frame: &mut Frame, area: Rect, app: &mut App) {
         Span::raw(" quit"),
     ]);
     let footer = Paragraph::new(help).alignment(Alignment::Center);
-
-    let footer_area = Rect {
-        x: area.x,
-        y: area.bottom().saturating_sub(1),
-        width: area.width,
-        height: 1,
-    };
-    frame.render_widget(footer, footer_area);
+    frame.render_widget(footer, right_chunks[2]);
 }
 
 fn content_cursor_to_screen(area: Rect, app: &App) -> (u16, u16) {

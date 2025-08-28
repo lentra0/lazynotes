@@ -1,5 +1,8 @@
 use crate::config::Config;
-use crate::fs_ops::{ensure_notes_dir, list_notes, read_note, rename_note, write_note, NoteMeta};
+use crate::fs_ops::{
+    build_notes_tree, ensure_notes_dir, flatten_tree_for_sidebar, read_note, rename_note,
+    write_note, FlatNode,
+};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -12,8 +15,9 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::widgets::ListState;
 use ratatui::Terminal;
+use std::collections::HashSet;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use time::macros::format_description;
 use time::OffsetDateTime;
 
@@ -31,12 +35,15 @@ pub enum RightFocus {
 }
 
 pub struct App {
-    // config & fs
+    // filesystem
     pub notes_dir: PathBuf,
-    pub notes: Vec<NoteMeta>,
-    // sidebar
+
+    // sidebar tree (flattened)
+    pub sidebar_items: Vec<FlatNode>,
+    pub expanded_dirs: HashSet<PathBuf>,
     pub sidebar_state: ListState,
-    // open buffer
+
+    // editor buffer
     pub title: String,
     pub title_cursor: usize,
     pub lines: Vec<String>,
@@ -45,9 +52,11 @@ pub struct App {
     pub scroll_y: usize,
     pub opened_path: Option<PathBuf>,
     pub dirty: bool,
+
     // focus
     pub focus: Focus,
     pub last_right_focus: RightFocus,
+
     // terminal
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
 }
@@ -57,13 +66,16 @@ impl App {
         let notes_dir = config.notes_path();
         ensure_notes_dir(&notes_dir)?;
 
-        let notes = list_notes(&notes_dir)?;
+        let mut expanded_dirs = HashSet::new();
+        expanded_dirs.insert(notes_dir.clone()); // root expanded by default
+
+        let sidebar_items = Self::build_sidebar(&notes_dir, &expanded_dirs)?;
+
         let mut sidebar_state = ListState::default();
-        if !notes.is_empty() {
+        if !sidebar_items.is_empty() {
             sidebar_state.select(Some(0));
         }
 
-        // terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -72,7 +84,8 @@ impl App {
 
         Ok(Self {
             notes_dir,
-            notes,
+            sidebar_items,
+            expanded_dirs,
             sidebar_state,
             title: String::new(),
             title_cursor: 0,
@@ -91,7 +104,6 @@ impl App {
     pub fn run(&mut self) -> Result<()> {
         let res = self.event_loop();
 
-        // restore terminal
         disable_raw_mode()?;
         execute!(
             self.terminal.backend_mut(),
@@ -105,6 +117,7 @@ impl App {
 
     fn event_loop(&mut self) -> Result<()> {
         loop {
+            // avoid self-borrow clash with Terminal::draw closure
             let self_ptr: *mut App = self;
             self.terminal.draw(|f| {
                 let app: &mut App = unsafe { &mut *self_ptr };
@@ -129,24 +142,24 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
-        // global quit
+        // quit
         if key.code == KeyCode::Char('q') && key.modifiers.is_empty() {
             return Ok(true);
         }
 
-        // global save
+        // save
         if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.save_current()?;
             return Ok(false);
         }
 
-        // global new note
+        // new draft
         if key.code == KeyCode::Char('n') && key.modifiers.is_empty() {
             self.create_new_note()?;
             return Ok(false);
         }
 
-        // global focus quick switch with h/l
+        // quick focus switch h/l
         if key.modifiers.is_empty() {
             match key.code {
                 KeyCode::Char('h') => {
@@ -188,28 +201,31 @@ impl App {
     }
 
     fn handle_sidebar_key(&mut self, key: KeyEvent) -> Result<()> {
-        let selected = self.sidebar_state.selected();
+        let len = self.sidebar_items.len();
+        let selected = self.sidebar_state.selected().unwrap_or(0);
+
         match key.code {
             KeyCode::Up => {
-                if let Some(i) = selected {
-                    let new = i.saturating_sub(1);
+                if len > 0 {
+                    let new = selected.saturating_sub(1);
                     self.sidebar_state.select(Some(new));
                 }
             }
             KeyCode::Down => {
-                if let Some(i) = selected {
-                    if i + 1 < self.notes.len() {
-                        self.sidebar_state.select(Some(i + 1));
-                    }
-                } else if !self.notes.is_empty() {
-                    self.sidebar_state.select(Some(0));
+                if len > 0 {
+                    let new = (selected + 1).min(len - 1);
+                    self.sidebar_state.select(Some(new));
                 }
             }
             KeyCode::Enter => {
-                self.open_selected()?;
+                self.sidebar_enter_action(selected)?;
+            }
+            KeyCode::Char(' ') => {
+                // Space toggles folders too
+                self.sidebar_toggle_dir(selected)?;
             }
             KeyCode::Right => {
-                // quick switch to right
+                // quick switch to right panel keeping last focus
                 self.focus = match self.last_right_focus {
                     RightFocus::Title => Focus::Title,
                     RightFocus::Content => Focus::Content,
@@ -217,6 +233,39 @@ impl App {
             }
             _ => {}
         }
+
+        Ok(())
+    }
+
+    fn sidebar_enter_action(&mut self, idx: usize) -> Result<()> {
+        if idx >= self.sidebar_items.len() {
+            return Ok(());
+        }
+        if self.sidebar_items[idx].is_dir {
+            // toggle expansion
+            self.sidebar_toggle_dir(idx)?;
+        } else {
+            let path = self.sidebar_items[idx].path.clone();
+            self.open_file(&path)?;
+        }
+        Ok(())
+    }
+
+
+    fn sidebar_toggle_dir(&mut self, idx: usize) -> Result<()> {
+        if idx >= self.sidebar_items.len() {
+            return Ok(());
+        }
+        let item = &self.sidebar_items[idx];
+        if !item.is_dir {
+            return Ok(());
+        }
+        if self.expanded_dirs.contains(&item.path) {
+            self.expanded_dirs.remove(&item.path);
+        } else {
+            self.expanded_dirs.insert(item.path.clone());
+        }
+        self.refresh_sidebar_preserve_selection(Some(idx));
         Ok(())
     }
 
@@ -243,17 +292,20 @@ impl App {
                 if self.title_cursor > 0 {
                     self.title.remove(self.title_cursor - 1);
                     self.title_cursor -= 1;
+                    self.dirty = true;
                 }
             }
             KeyCode::Delete => {
                 if self.title_cursor < self.title.len() {
                     self.title.remove(self.title_cursor);
+                    self.dirty = true;
                 }
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if c != '/' && c != '\\' && c != '.' && c != '\n' && c != '\r' {
                     self.title.insert(self.title_cursor, c);
                     self.title_cursor += 1;
+                    self.dirty = true;
                 }
             }
             _ => {}
@@ -339,10 +391,7 @@ impl App {
     }
 
     fn ensure_cursor_visible(&mut self) {
-        // simple vertical scroll: keep cursor within viewport window height guess
-        // This function will be called after drawing too, but we don't know exact area height here.
-        // Use a heuristic window of 20 lines; it's corrected by UI via paragraph scroll.
-        let window = 20usize;
+        let window = 20usize; // heuristic; UI sets precise scroll when rendering
         if self.cursor_row < self.scroll_y {
             self.scroll_y = self.cursor_row;
         } else if self.cursor_row >= self.scroll_y + window {
@@ -350,24 +399,26 @@ impl App {
         }
     }
 
-    fn open_selected(&mut self) -> Result<()> {
-        if let Some(i) = self.sidebar_state.selected() {
-            if let Some(meta) = self.notes.get(i) {
-                let content = read_note(&meta.path).unwrap_or_default();
-                self.title = meta.title.clone();
-                self.title_cursor = self.title.len();
-                self.lines = split_lines_preserve(&content);
-                if self.lines.is_empty() {
-                    self.lines.push(String::new());
-                }
-                self.cursor_row = 0;
-                self.cursor_col = 0;
-                self.scroll_y = 0;
-                self.opened_path = Some(meta.path.clone());
-                self.dirty = false;
-                self.focus = self.last_right_focus.into();
-            }
+    fn open_file(&mut self, path: &Path) -> Result<()> {
+        let content = read_note(path).unwrap_or_default();
+        let title = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+
+        self.title = title;
+        self.title_cursor = self.title.len();
+        self.lines = split_lines_preserve(&content);
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
         }
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.scroll_y = 0;
+        self.opened_path = Some(path.to_path_buf());
+        self.dirty = false;
+        self.focus = self.last_right_focus.into();
         Ok(())
     }
 
@@ -386,18 +437,6 @@ impl App {
         self.opened_path = None;
         self.dirty = true;
 
-        // Add to notes list if not present
-        let path = self.notes_dir.join(format!("{}.md", self.title));
-        let meta = NoteMeta {
-            title: self.title.clone(),
-            path,
-        };
-        self.notes.push(meta);
-        self.notes.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-        // select it
-        if let Some(pos) = self.notes.iter().position(|n| n.title == self.title) {
-            self.sidebar_state.select(Some(pos));
-        }
         self.focus = Focus::Title;
         self.last_right_focus = RightFocus::Title;
         Ok(())
@@ -405,18 +444,15 @@ impl App {
 
     fn save_current(&mut self) -> Result<()> {
         if self.title.trim().is_empty() {
-            return Ok(()); // ignore saving empty title
+            return Ok(()); // ignore saving with empty title
         }
         let new_path = self.notes_dir.join(format!("{}.md", self.title.trim()));
         let content = self.lines.join("\n");
 
-        // If previously opened another path, rename if different
         if let Some(old) = &self.opened_path {
             if *old != new_path {
-                // Ensure no collision: if new_path exists and not the same file, we will overwrite
-                // (simple approach). Could also disallow; for now overwrite.
-                write_note(&new_path, &content)?;
-                rename_note(old, &new_path).ok(); // best-effort
+                write_note(&new_path, &content)?; // write new content
+                rename_note(old, &new_path).ok(); // try rename original (best-effort)
             } else {
                 write_note(&new_path, &content)?;
             }
@@ -427,14 +463,37 @@ impl App {
         self.opened_path = Some(new_path.clone());
         self.dirty = false;
 
-        // Update notes list
-        let title_now = self.title.clone();
-        self.notes = list_notes(&self.notes_dir)?;
-        if let Some(pos) = self.notes.iter().position(|n| n.title == title_now) {
-            self.sidebar_state.select(Some(pos));
-        }
+        // refresh sidebar and select this file
+        self.refresh_sidebar_select_path(&new_path);
 
         Ok(())
+    }
+
+    fn refresh_sidebar_select_path(&mut self, path: &Path) {
+        self.refresh_sidebar_preserve_selection(None);
+        if let Some(idx) = self
+            .sidebar_items
+            .iter()
+            .position(|n| !n.is_dir && n.path == path)
+        {
+            self.sidebar_state.select(Some(idx));
+        }
+    }
+
+    fn refresh_sidebar_preserve_selection(&mut self, prefer_idx: Option<usize>) {
+        let old_idx = prefer_idx.or(self.sidebar_state.selected());
+        self.sidebar_items = Self::build_sidebar(&self.notes_dir, &self.expanded_dirs).unwrap_or_default();
+        if !self.sidebar_items.is_empty() {
+            let idx = old_idx.unwrap_or(0).min(self.sidebar_items.len() - 1);
+            self.sidebar_state.select(Some(idx));
+        } else {
+            self.sidebar_state.select(None);
+        }
+    }
+
+    fn build_sidebar(notes_dir: &Path, expanded: &HashSet<PathBuf>) -> Result<Vec<FlatNode>> {
+        let tree = build_notes_tree(notes_dir)?;
+        Ok(flatten_tree_for_sidebar(&tree, expanded))
     }
 }
 
@@ -452,7 +511,7 @@ fn split_lines_preserve(s: &str) -> Vec<String> {
     for (_i, line) in s.split_inclusive('\n').enumerate() {
         if line.ends_with('\n') {
             let mut ln = line.to_string();
-            ln.pop(); // remove trailing \n, will be reconstructed by join
+            ln.pop(); // strip trailing \n; reconstruct on join
             out.push(ln);
         } else {
             out.push(line.to_string());
