@@ -1,7 +1,8 @@
 mod app;
 mod config;
-mod fs_ops;
+mod fs;
 mod ui;
+mod git;
 
 use anyhow::Result;
 use app::App;

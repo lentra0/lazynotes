@@ -12,18 +12,20 @@ pub enum NoteNode {
         children: Vec<NoteNode>,
     },
     File {
-        title: String, // stem without .md
-        path: PathBuf, // full path to .md
+        title: String,
+        path: PathBuf,
     },
 }
 
 #[derive(Debug, Clone)]
 pub struct FlatNode {
-    pub name: String,       // name displayed (folder or file stem)
-    pub depth: usize,       // depth level for indentation
-    pub path: PathBuf,      // dir or file path
-    pub is_dir: bool,       // true for folder, false for file
-    pub expanded: bool,     // only meaningful for dir
+    pub name: String,
+    pub depth: usize,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub expanded: bool,
+    pub last_in_parent: bool,
+    pub last_ancestors: Vec<bool>,
 }
 
 pub fn ensure_notes_dir(dir: &Path) -> Result<()> {
@@ -65,7 +67,6 @@ pub fn build_notes_tree(dir: &Path) -> Result<NoteNode> {
         let p = entry.path();
 
         if p.is_dir() {
-            // skip hidden directories by default (feel free to remove this if you want dotfolders)
             if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
                 if name.starts_with('.') {
                     continue;
@@ -73,10 +74,11 @@ pub fn build_notes_tree(dir: &Path) -> Result<NoteNode> {
             }
             children.push(build_notes_tree(&p)?);
         } else if p.is_file() {
-            if p.extension().and_then(|e| e.to_str()) == Some("md") {
-                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+            if let Some(fname) = p.file_name().and_then(|s| s.to_str()) {
+                if fname.starts_with('.') {
+                } else {
                     children.push(NoteNode::File {
-                        title: stem.to_string(),
+                        title: fname.to_string(),
                         path: p.clone(),
                     });
                 }
@@ -84,7 +86,6 @@ pub fn build_notes_tree(dir: &Path) -> Result<NoteNode> {
         }
     }
 
-    // sort: dirs first (by name), then files (by title), case-insensitive
     children.sort_by(|a, b| match (a, b) {
         (NoteNode::Dir { name: an, .. }, NoteNode::Dir { name: bn, .. }) => an.to_lowercase().cmp(&bn.to_lowercase()),
         (NoteNode::Dir { .. }, NoteNode::File { .. }) => std::cmp::Ordering::Less,
@@ -98,7 +99,6 @@ pub fn build_notes_tree(dir: &Path) -> Result<NoteNode> {
         .map(|s| s.to_string())
         .unwrap_or_else(|| dir.to_string_lossy().to_string());
 
-
     Ok(NoteNode::Dir {
         name,
         path: dir.to_path_buf(),
@@ -106,25 +106,30 @@ pub fn build_notes_tree(dir: &Path) -> Result<NoteNode> {
     })
 }
 
-// Flatten the tree for display as a 1D list with indentation.
-// We skip the root node row and render only its children at depth 0.
 pub fn flatten_tree_for_sidebar(root: &NoteNode, expanded: &HashSet<PathBuf>) -> Vec<FlatNode> {
     let mut out = Vec::new();
     match root {
         NoteNode::Dir { children, .. } => {
-            for child in children {
-                flatten_node(child, 0, expanded, &mut out);
+            for (i, child) in children.iter().enumerate() {
+                let is_last = i + 1 == children.len();
+                flatten_node(child, 0, expanded, is_last, &mut out, &mut Vec::new());
             }
         }
         NoteNode::File { .. } => {
-            // Shouldn't happen for our root, but handle anyway
-            flatten_node(root, 0, expanded, &mut out);
+            flatten_node(root, 0, expanded, true, &mut out, &mut Vec::new());
         }
     }
     out
 }
 
-fn flatten_node(node: &NoteNode, depth: usize, expanded: &HashSet<PathBuf>, out: &mut Vec<FlatNode>) {
+fn flatten_node(
+    node: &NoteNode,
+    depth: usize,
+    expanded: &HashSet<PathBuf>,
+    last_in_parent: bool,
+    out: &mut Vec<FlatNode>,
+    ancestors_last: &mut Vec<bool>,
+) {
     match node {
         NoteNode::Dir { name, path, children } => {
             let is_expanded = expanded.contains(path);
@@ -134,11 +139,16 @@ fn flatten_node(node: &NoteNode, depth: usize, expanded: &HashSet<PathBuf>, out:
                 path: path.clone(),
                 is_dir: true,
                 expanded: is_expanded,
+                last_in_parent,
+                last_ancestors: ancestors_last.clone(),
             });
             if is_expanded {
-                for child in children {
-                    flatten_node(child, depth + 1, expanded, out);
+                ancestors_last.push(last_in_parent);
+                for (i, child) in children.iter().enumerate() {
+                    let child_is_last = i + 1 == children.len();
+                    flatten_node(child, depth + 1, expanded, child_is_last, out, ancestors_last);
                 }
+                ancestors_last.pop();
             }
         }
         NoteNode::File { title, path } => {
@@ -148,6 +158,8 @@ fn flatten_node(node: &NoteNode, depth: usize, expanded: &HashSet<PathBuf>, out:
                 path: path.clone(),
                 is_dir: false,
                 expanded: false,
+                last_in_parent,
+                last_ancestors: ancestors_last.clone(),
             });
         }
     }
